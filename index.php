@@ -69,6 +69,18 @@ class CacheManager {
         
         file_put_contents($file, serialize($data));
     }
+
+    public function getRemainingTime($repoUrl, $branch, $limit) {
+        $key = $this->getCacheKey($repoUrl, $branch, $limit);
+        $file = $this->getCacheFile($key);
+        
+        if (file_exists($file)) {
+            $remainingTime = GITVIZ_CACHE_DURATION - (time() - filemtime($file));
+            return max(0, $remainingTime);
+        }
+        
+        return 0;
+    }
 }
 
 class RateLimiter {
@@ -123,6 +135,7 @@ class GitVisualizer {
 
     private $cache;
     private $rateLimiter;
+    private $remainingCacheTime = null;
     
     private $typeEmojis = [
         'feat' => '✨',
@@ -187,6 +200,11 @@ class GitVisualizer {
             );
 
             if ($cachedCommits !== null) {
+                $this->remainingCacheTime = $this->cache->getRemainingTime(
+                    $this->config['repo_url'],
+                    $this->config['branch'],
+                    $this->config['limit']
+                );
                 $this->logger->log("Using cached data for " . $this->config['repo_url']);
                 $svg = $this->generateSVG($cachedCommits);
             } else {
@@ -367,7 +385,6 @@ class GitVisualizer {
     }
 
     private function generateSVG($commits) {
-        // [SVG 生成部分的代码保持不变]
         $colors = $this->config['dark_mode'] ? [
             'background' => '#1a1a1a',
             'text' => '#ffffff',
@@ -395,6 +412,9 @@ class GitVisualizer {
         ];
 
         $height = count($commits) * 120 + 40;
+        if ($this->remainingCacheTime !== null) {
+            $height += 30; // 为缓存提示信息增加高度
+        }
         
         $svg = <<<SVG
 <?xml version="1.0" encoding="UTF-8"?>
@@ -406,11 +426,24 @@ class GitVisualizer {
         .commit-meta { font: italic 10px system-ui; }
         .commit-info { font: 10px monospace; }
         .commit-emoji { font: 14px system-ui; }
+        .cache-notice { font: italic 12px system-ui; fill: {$colors['text']}; opacity: 0.8; }
     </style>
 
 SVG;
 
-        $y = 20;
+        if ($this->remainingCacheTime !== null) {
+            $svg .= <<<SVG
+    <text x="20" y="20" class="cache-notice">
+        此结果从缓存中取得, 距离缓存失效剩余 {$this->remainingCacheTime} 秒.
+    </text>
+
+SVG;
+            $startY = 50; // 调整后续内容的起始位置
+        } else {
+            $startY = 20;
+        }
+
+        $y = $startY;
         foreach ($commits as $commit) {
             $color = $colors[$commit['type']] ?? $colors['other'];
             $title = htmlspecialchars($commit['title']);
