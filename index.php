@@ -9,6 +9,11 @@ define('GITVIZ_LOG_PATH', dirname(__FILE__) . '/logs');
 define('GITVIZ_LOG_FILE', GITVIZ_LOG_PATH . '/gitviz-' . date('Y-m-d') . '.log');
 define('GITVIZ_DEBUG', false);
 
+define('GITVIZ_CACHE_DURATION', 300); // 缓存持续时间（秒）
+define('GITVIZ_RATE_LIMIT_DURATION', 30); // 频率限制时间窗口（秒）
+define('GITVIZ_RATE_LIMIT_MAX_REQUESTS', 5); // 频率限制最大请求数
+define('GITVIZ_CACHE_PATH', dirname(__FILE__) . '/cache');
+
 class Logger {
     private $logFile;
     
@@ -29,10 +34,95 @@ class Logger {
     }
 }
 
+class CacheManager {
+    private $cacheDir;
+    
+    public function __construct() {
+        $this->cacheDir = GITVIZ_CACHE_PATH;
+        if (!is_dir($this->cacheDir)) {
+            mkdir($this->cacheDir, 0755, true);
+        }
+    }
+    
+    private function getCacheKey($repoUrl, $branch, $limit) {
+        return md5($repoUrl . $branch . $limit);
+    }
+    
+    private function getCacheFile($key) {
+        return $this->cacheDir . '/' . $key . '.cache';
+    }
+    
+    public function get($repoUrl, $branch, $limit) {
+        $key = $this->getCacheKey($repoUrl, $branch, $limit);
+        $file = $this->getCacheFile($key);
+        
+        if (file_exists($file) && (time() - filemtime($file)) < GITVIZ_CACHE_DURATION) {
+            return unserialize(file_get_contents($file));
+        }
+        
+        return null;
+    }
+    
+    public function set($repoUrl, $branch, $limit, $data) {
+        $key = $this->getCacheKey($repoUrl, $branch, $limit);
+        $file = $this->getCacheFile($key);
+        
+        file_put_contents($file, serialize($data));
+    }
+}
+
+class RateLimiter {
+    private $cacheDir;
+    
+    public function __construct() {
+        $this->cacheDir = GITVIZ_CACHE_PATH . '/ratelimit';
+        if (!is_dir($this->cacheDir)) {
+            mkdir($this->cacheDir, 0755, true);
+        }
+    }
+    
+    private function getClientIP() {
+        return $_SERVER['HTTP_X_FORWARDED_FOR'] ?? $_SERVER['REMOTE_ADDR'] ?? '0.0.0.0';
+    }
+    
+    private function getRateLimitFile() {
+        return $this->cacheDir . '/' . md5($this->getClientIP()) . '.limit';
+    }
+    
+    public function isLimited() {
+        $file = $this->getRateLimitFile();
+        
+        if (!file_exists($file)) {
+            $data = ['requests' => [], 'count' => 0];
+        } else {
+            $data = unserialize(file_get_contents($file));
+            // 清理过期的请求记录
+            $data['requests'] = array_filter($data['requests'], function($time) {
+                return (time() - $time) < GITVIZ_RATE_LIMIT_DURATION;
+            });
+            $data['count'] = count($data['requests']);
+        }
+        
+        if ($data['count'] >= GITVIZ_RATE_LIMIT_MAX_REQUESTS) {
+            return true;
+        }
+        
+        // 记录新的请求
+        $data['requests'][] = time();
+        $data['count']++;
+        file_put_contents($file, serialize($data));
+        
+        return false;
+    }
+}
+
 class GitVisualizer {
     private $config;
     private $errors = [];
     private $logger;
+
+    private $cache;
+    private $rateLimiter;
     
     private $typeEmojis = [
         'feat' => '✨',
@@ -51,6 +141,8 @@ class GitVisualizer {
 
     public function __construct() {
         $this->logger = new Logger();
+        $this->cache = new CacheManager();
+        $this->rateLimiter = new RateLimiter();
         $this->config = [
             'repo_url' => $_GET['repo'] ?? null,
             'limit' => isset($_GET['limit']) ? min(max((int)$_GET['limit'], 1), 50) : 10,
@@ -62,6 +154,7 @@ class GitVisualizer {
         $this->logger->log("Configuration: " . json_encode($this->config));
     }
 
+
     private function detectDarkMode() {
         return isset($_GET['dark_mode']) ? 
             filter_var($_GET['dark_mode'], FILTER_VALIDATE_BOOLEAN) : 
@@ -71,6 +164,14 @@ class GitVisualizer {
 
     public function process() {
         try {
+            // 检查访问频率限制
+            if ($this->rateLimiter->isLimited()) {
+                $this->errors[] = 'Rate limit exceeded. Please try again later.';
+                $this->logger->log("Rate limit exceeded for IP", 'WARNING');
+                $this->sendError(429);
+                return;
+            }
+
             $this->validateInput();
             if (!empty($this->errors)) {
                 $this->logger->log("Validation errors: " . json_encode($this->errors), 'ERROR');
@@ -78,11 +179,29 @@ class GitVisualizer {
                 return;
             }
 
-            $commits = $this->fetchCommits();
-            $svg = $this->generateSVG($commits);
+            // 检查缓存
+            $cachedCommits = $this->cache->get(
+                $this->config['repo_url'],
+                $this->config['branch'],
+                $this->config['limit']
+            );
+
+            if ($cachedCommits !== null) {
+                $this->logger->log("Using cached data for " . $this->config['repo_url']);
+                $svg = $this->generateSVG($cachedCommits);
+            } else {
+                $commits = $this->fetchCommits();
+                $this->cache->set(
+                    $this->config['repo_url'],
+                    $this->config['branch'],
+                    $this->config['limit'],
+                    $commits
+                );
+                $svg = $this->generateSVG($commits);
+            }
             
             header('Content-Type: image/svg+xml');
-            header('Cache-Control: public, max-age=300');
+            header('Cache-Control: public, max-age=' . GITVIZ_CACHE_DURATION);
             echo $svg;
             
             $this->logger->log("Successfully generated SVG for " . $this->config['repo_url']);
